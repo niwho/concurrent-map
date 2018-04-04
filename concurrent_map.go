@@ -3,6 +3,7 @@ package cmap
 import (
 	"encoding/json"
 	"sync"
+	"time"
 )
 
 var SHARD_COUNT = 32
@@ -15,6 +16,18 @@ type ConcurrentMap []*ConcurrentMapShared
 type ConcurrentMapShared struct {
 	items        map[string]interface{}
 	sync.RWMutex // Read Write mutex, guards access to internal map.
+
+	coLoad func(key string) (interface{}, error)
+}
+
+type Clock interface {
+	Now() time.Time
+}
+
+type simpleItem struct {
+	clock      Clock
+	value      interface{}
+	expiration *time.Time
 }
 
 // Creates a new concurrent map.
@@ -22,6 +35,14 @@ func New() ConcurrentMap {
 	m := make(ConcurrentMap, SHARD_COUNT)
 	for i := 0; i < SHARD_COUNT; i++ {
 		m[i] = &ConcurrentMapShared{items: make(map[string]interface{})}
+	}
+	return m
+}
+
+func NewV2(coLoad func(key string) (interface{}, error)) ConcurrentMap {
+	m := make(ConcurrentMap, SHARD_COUNT)
+	for i := 0; i < SHARD_COUNT; i++ {
+		m[i] = &ConcurrentMapShared{items: make(map[string]interface{}), coLoad: coLoad}
 	}
 	return m
 }
@@ -88,6 +109,29 @@ func (m ConcurrentMap) Get(key string) (interface{}, bool) {
 	val, ok := shard.items[key]
 	shard.RUnlock()
 	return val, ok
+}
+
+// Retrieves an element from map under given key.
+func (m ConcurrentMap) GetV2(key string) (interface{}, error) {
+	var err error
+	val, ok := m.Get(key)
+	if !ok {
+		if m[0].coLoad != nil {
+			shard := m.GetShard(key)
+			shard.Lock()
+			// 再判断一次
+			if val, ok := shard.items[key]; ok {
+				return val, nil
+			}
+			// 触发加载
+			val, err = m[0].coLoad(key)
+			if err == nil {
+				shard.items[key] = val
+			}
+			shard.Unlock()
+		}
+	}
+	return val, err
 }
 
 // Returns the number of elements within the map.
