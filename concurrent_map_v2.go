@@ -124,6 +124,7 @@ func (m ConcurrentMapWithExpire) GetV2(key string) (interface{}, error) {
 			shard.Lock()
 			// 再判断一次
 			if val, ok := shard.items[key]; ok {
+				shard.Unlock()
 				return val, nil
 			}
 			// 触发加载
