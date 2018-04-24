@@ -14,6 +14,9 @@ type ConcurrentMapWithExpire struct {
 	coMap []*ConcurrentMapSharedSimple
 
 	coLoad func(key string) (interface{}, error)
+
+	expiration *time.Duration
+	clock      Clock
 }
 
 // A "thread" safe string to anything map.
@@ -23,14 +26,21 @@ type ConcurrentMapSharedSimple struct {
 
 }
 
-type Clock interface {
-	Now() time.Time
-}
-
 type simpleItem struct {
 	clock      Clock
 	value      interface{}
 	expiration *time.Time
+}
+
+func (si *simpleItem) IsExpired(now *time.Time) bool {
+	if si.expiration == nil {
+		return false
+	}
+	if now == nil {
+		t := si.clock.Now()
+		now = &t
+	}
+	return si.expiration.Before(*now)
 }
 
 // Creates a new concurrent map.
@@ -42,11 +52,13 @@ func NewA() ConcurrentMapWithExpire {
 	return m
 }
 
-func NewAV2(coLoad func(key string) (interface{}, error)) ConcurrentMapWithExpire {
+func NewAV2(coLoad func(key string) (interface{}, error), ex *time.Duration) ConcurrentMapWithExpire {
 	m := ConcurrentMapWithExpire{coMap: make([]*ConcurrentMapSharedSimple, SHARD_COUNT), coLoad: coLoad}
 	for i := 0; i < SHARD_COUNT; i++ {
 		m.coMap[i] = &ConcurrentMapSharedSimple{items: make(map[string]*simpleItem)}
 	}
+	m.expiration = ex
+	m.clock = NewRealClock()
 	return m
 }
 
@@ -57,10 +69,7 @@ func (m ConcurrentMapWithExpire) GetShard(key string) *ConcurrentMapSharedSimple
 
 func (m ConcurrentMapWithExpire) MSet(data map[string]interface{}) {
 	for key, value := range data {
-		shard := m.GetShard(key)
-		shard.Lock()
-		shard.items[key] = &simpleItem{value: value}
-		shard.Unlock()
+		m.Set(key, value)
 	}
 }
 
@@ -69,7 +78,12 @@ func (m ConcurrentMapWithExpire) Set(key string, value interface{}) {
 	// Get map shard.
 	shard := m.GetShard(key)
 	shard.Lock()
-	shard.items[key] = &simpleItem{value: value}
+	item := &simpleItem{value: value, clock: m.clock}
+	if m.expiration != nil {
+		t := item.clock.Now().Add(*m.expiration)
+		item.expiration = &t
+	}
+	shard.items[key] = item
 	shard.Unlock()
 }
 
@@ -85,7 +99,14 @@ func (m ConcurrentMapWithExpire) Upsert(key string, value interface{}, cb Upsert
 	shard.Lock()
 	v, ok := shard.items[key]
 	res = cb(ok, v, value)
-	shard.items[key] = &simpleItem{value: res}
+
+	item := &simpleItem{value: res, clock: m.clock}
+	if m.expiration != nil {
+		t := item.clock.Now().Add(*m.expiration)
+		item.expiration = &t
+	}
+	shard.items[key] = item
+
 	shard.Unlock()
 	return res
 }
@@ -97,7 +118,11 @@ func (m ConcurrentMapWithExpire) SetIfAbsent(key string, value interface{}) bool
 	shard.Lock()
 	_, ok := shard.items[key]
 	if !ok {
-		shard.items[key] = &simpleItem{value: value}
+		item := &simpleItem{value: value, clock: m.clock}
+		if m.expiration != nil {
+			t := item.clock.Now().Add(*m.expiration)
+			item.expiration = &t
+		}
 	}
 	shard.Unlock()
 	return !ok
@@ -110,8 +135,14 @@ func (m ConcurrentMapWithExpire) Get(key string) (interface{}, bool) {
 	shard.RLock()
 	// Get item from shard.
 	val, ok := shard.items[key]
+	// 过期时间判断 todo
+	if ok && !val.IsExpired(nil) {
+		shard.Unlock()
+		return val.value, true
+	}
+
 	shard.RUnlock()
-	return val, ok
+	return nil, false
 }
 
 // Retrieves an element from map under given key.
@@ -124,8 +155,10 @@ func (m ConcurrentMapWithExpire) GetV2(key string) (interface{}, error) {
 			shard.Lock()
 			// 再判断一次
 			if val, ok := shard.items[key]; ok {
-				shard.Unlock()
-				return val, nil
+				if !val.IsExpired(nil) {
+					shard.Unlock()
+					return val.value, nil
+				}
 			}
 			// 触发加载
 			val, err = m.coLoad(key)
@@ -151,6 +184,7 @@ func (m ConcurrentMapWithExpire) Count() int {
 }
 
 // Looks up an item under specified key
+// 这里没有判断过期情况
 func (m ConcurrentMapWithExpire) Has(key string) bool {
 	// Get shard
 	shard := m.GetShard(key)
@@ -209,7 +243,7 @@ func (m ConcurrentMapWithExpire) IsEmpty() bool {
 // Used by the Iter & IterBuffered functions to wrap two variables together over a channel,
 type TupleA struct {
 	Key string
-	Val interface{}
+	Val *simpleItem
 }
 
 // Returns an iterator which could be used in a for range loop.
@@ -282,10 +316,20 @@ func (m ConcurrentMapWithExpire) Items() map[string]interface{} {
 
 	// Insert items to temporary map.
 	for item := range m.IterBuffered() {
-		tmp[item.Key] = item.Val
+		tmp[item.Key] = item.Val.value
 	}
 
 	return tmp
+}
+
+func (m ConcurrentMapWithExpire) Purge() {
+	// Insert items to temporary map.
+	for item := range m.IterBuffered() {
+		if item.Val.IsExpired(nil) {
+			m.Remove(item.Key)
+		}
+	}
+
 }
 
 // Iterator callback,called for every key,value found in
