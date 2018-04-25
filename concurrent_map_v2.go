@@ -137,7 +137,7 @@ func (m ConcurrentMapWithExpire) Get(key string) (interface{}, bool) {
 	val, ok := shard.items[key]
 	// 过期时间判断 todo
 	if ok && !val.IsExpired(nil) {
-		shard.Unlock()
+		shard.RUnlock()
 		return val.value, true
 	}
 
