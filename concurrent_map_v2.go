@@ -13,7 +13,7 @@ import (
 type ConcurrentMapWithExpire struct {
 	coMap []*ConcurrentMapSharedSimple
 
-	coLoad func(key string) (interface{}, error)
+	coLoad func(key string) (interface{}, *time.Duration, error)
 
 	expiration *time.Duration
 	clock      Clock
@@ -52,7 +52,7 @@ func NewA() ConcurrentMapWithExpire {
 	return m
 }
 
-func NewAV2(coLoad func(key string) (interface{}, error), ex *time.Duration) ConcurrentMapWithExpire {
+func NewAV2(coLoad func(key string) (interface{}, *time.Duration, error), ex *time.Duration) ConcurrentMapWithExpire {
 	m := ConcurrentMapWithExpire{coMap: make([]*ConcurrentMapSharedSimple, SHARD_COUNT), coLoad: coLoad}
 	for i := 0; i < SHARD_COUNT; i++ {
 		m.coMap[i] = &ConcurrentMapSharedSimple{items: make(map[string]*simpleItem)}
@@ -148,6 +148,7 @@ func (m ConcurrentMapWithExpire) Get(key string) (interface{}, bool) {
 // Retrieves an element from map under given key.
 func (m ConcurrentMapWithExpire) GetV2(key string) (interface{}, error) {
 	var err error
+	var ex *time.Duration
 	val, ok := m.Get(key)
 	if !ok {
 		if m.coLoad != nil {
@@ -161,9 +162,17 @@ func (m ConcurrentMapWithExpire) GetV2(key string) (interface{}, error) {
 				}
 			}
 			// 触发加载
-			val, err = m.coLoad(key)
+			val, ex, err = m.coLoad(key)
 			if err == nil {
-				shard.items[key] = &simpleItem{value: val}
+				item := &simpleItem{value: val, clock: m.clock}
+				if ex != nil {
+					t := item.clock.Now().Add(*ex)
+					item.expiration = &t
+				} else if m.expiration != nil {
+					t := item.clock.Now().Add(*m.expiration)
+					item.expiration = &t
+				}
+				shard.items[key] = item
 			}
 			shard.Unlock()
 		}
