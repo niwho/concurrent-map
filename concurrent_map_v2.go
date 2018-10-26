@@ -2,6 +2,7 @@ package cmap
 
 import (
 	"encoding/json"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -17,6 +18,7 @@ type ConcurrentMapWithExpire struct {
 
 	expiration *time.Duration
 	clock      Clock
+	reNew      bool
 }
 
 // A "thread" safe string to anything map.
@@ -52,13 +54,29 @@ func NewA() ConcurrentMapWithExpire {
 	return m
 }
 
-func NewAV2(coLoad func(key string) (interface{}, *time.Duration, error), ex *time.Duration) ConcurrentMapWithExpire {
+func NewAV2(coLoad func(key string) (interface{}, *time.Duration, error), ex *time.Duration, autoRenew bool) ConcurrentMapWithExpire {
 	m := ConcurrentMapWithExpire{coMap: make([]*ConcurrentMapSharedSimple, SHARD_COUNT), coLoad: coLoad}
 	for i := 0; i < SHARD_COUNT; i++ {
 		m.coMap[i] = &ConcurrentMapSharedSimple{items: make(map[string]*simpleItem)}
 	}
+	m.reNew = autoRenew
 	m.expiration = ex
 	m.clock = NewRealClock()
+	//定时主动Purge
+	go func() {
+		defer func() {
+			if err := recover(); err != nil {
+				const size = 64 << 20
+				buf := make([]byte, size)
+				buf = buf[:runtime.Stack(buf, false)]
+				fmt.Printf("panic=%v\n%s\n", err, buf)
+			}
+		}()
+		for {
+			time.Sleep(time.Minute * 10)
+			m.Purge()
+		}
+	}()
 	return m
 }
 
@@ -148,7 +166,7 @@ func (m ConcurrentMapWithExpire) Get(key string) (interface{}, bool) {
 // Retrieves an element from map under given key.
 func (m ConcurrentMapWithExpire) GetV2(key string) (interface{}, error) {
 	var err error
-	var ex *time.Duration
+	ex := m.expiration //默认值
 	val, ok := m.Get(key)
 	if !ok {
 		if m.coLoad != nil {
@@ -157,6 +175,12 @@ func (m ConcurrentMapWithExpire) GetV2(key string) (interface{}, error) {
 			// 再判断一次
 			if val, ok := shard.items[key]; ok {
 				if !val.IsExpired(nil) {
+					if m.reNew {
+						// 每次访问自动延长过期时间
+						// 所以这个接口的使用必须保证主动更新数据
+						t := val.clock.Now().Add(*ex)
+						val.expiration = &t
+					}
 					shard.Unlock()
 					return val.value, nil
 				}
